@@ -1,0 +1,44 @@
+Base URL: http://127.0.0.1:5000
+Content-Type: application/json
+
+1. Get Initial Configuration
+Used to populate the UI (dropdowns, search bars, and feature lists) on page load.
+Endpoint: /api/config
+Method: GET
+
+Returns:
+presets: Dictionary of player roles (e.g., "Deep Lying Playmaker") and their default stat weights.
+labels: Human-readable names for database columns.
+features: List of all available statistical columns.
+players: A list of all unique player names for the search bar.
+
+2. Attribute-Based Search
+Used to find players based on specific stats, age, and budget.
+Endpoint: /api/scout
+Method: POST
+Payload (JSON):
+JSON
+{
+  "role": "Striker (Complete)",
+  "budget": 60,
+  "max_age": 25,
+  "weights": {
+    "npxG_p90": 10,
+    "SCA90": 8,
+    "PrgP_p90": 5
+  }
+}
+Returns: A list of the top 50 player objects matching the criteria, ranked by Scout_Score.
+
+3. Find Player Clones
+Used to find the most statistically similar players to a specific target.
+Endpoint: /api/clone
+Method: GET
+Query Parameters: name (string)
+Example URL: /api/clone?name=Mohamed Salah
+Returns: A list of 15 player objects, including a Similarity percentage (0-100).
+
+
+CORS: Cross-Origin Resource Sharing is enabled on the server, so you can make requests directly from your frontend (React, Vue, etc.).
+Market Values: All budget inputs are in millions. Sending 50 represents €50,000,000.
+Scout Score: The Scout_Score returned in the search is a percentile-based calculation (0-100).
