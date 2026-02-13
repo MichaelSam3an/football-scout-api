@@ -3,15 +3,17 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.decomposition import PCA  # <--- NEW IMPORT
 
 class ScoutEngine:
     def __init__(self, filepath):
         self.filepath = filepath
         self.df = None
         self.player_names = []
-        self.ml_model = None
-        self.value_model = None
+        self.ml_model = None       # KNN
+        self.value_model = None    # Random Forest
         self.scaler = None
+        self.pca = None            # <--- PCA Model
         self.feature_cols = []
         self.presets = self._get_presets()
         self.labels = self._get_labels()
@@ -45,7 +47,7 @@ class ScoutEngine:
             self.df.replace([np.inf, -np.inf], 0, inplace=True)
             self.player_names = sorted(self.df['Player'].unique().tolist())
 
-            # Prepare ML
+            # Prepare ML Features
             exclude = ['Player', 'Squad', 'Nation', 'Pos', 'Comp', 'Age', 'Born', '90s', 'Min', 'Rk', 'market_value_in_eur', 'Fair_Value', 'Undervalued_Index']
             self.feature_cols = [c for c in self.df.columns if self.df[c].dtype in ['float64', 'int64'] and c not in exclude]
 
@@ -53,21 +55,31 @@ class ScoutEngine:
             self._train_models()
             return True
         except Exception as e:
-            print(f"Error loading data: {e}")
+            print(f"❌ Error loading data: {e}")
             return False
 
     def _train_models(self):
-        # 1. Clone Engine (KNN)
+        # --- 1. Clone Engine (PCA + KNN) ---
         self.scaler = StandardScaler()
-        X = self.scaler.fit_transform(self.df[self.feature_cols])
+        X_scaled = self.scaler.fit_transform(self.df[self.feature_cols])
+        
+        # Apply PCA to keep 95% of variance
+        self.pca = PCA(n_components=0.95)
+        X_pca = self.pca.fit_transform(X_scaled)
+        
+        print(f"📉 PCA Reduced Features: {X_scaled.shape[1]} -> {X_pca.shape[1]}")
+        
+        # Train KNN on compressed data
         self.ml_model = NearestNeighbors(n_neighbors=15, algorithm='ball_tree')
-        self.ml_model.fit(X)
+        self.ml_model.fit(X_pca)
 
-        # 2. Value Engine (Random Forest)
+        # --- 2. Value Engine (Random Forest) ---
         train_df = self.df[self.df['market_value_in_eur'] > 0].copy()
         if not train_df.empty:
             X_val = train_df[self.feature_cols + ['Age']]
             y_val = train_df['market_value_in_eur']
+            
+            # Random Forest handles raw data well, so we use X_val (not PCA)
             self.value_model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
             self.value_model.fit(X_val, y_val)
             
@@ -126,22 +138,36 @@ class ScoutEngine:
             
         target['Scout_Score'] = (scores / total_w) * 100
         result_df = target.sort_values(by='Scout_Score', ascending=False).head(50)
+        
+        # Format for API
         return result_df.to_dict(orient='records')
 
     def find_clones(self, player_name):
         matches = self.df[self.df['Player'] == player_name]
+        
+        # Fallback search
+        if matches.empty:
+            matches = self.df[self.df['Player'].str.contains(player_name, case=False, na=False)]
+            
         if matches.empty: return {"error": "Player not found"}
         
         target_player = matches.iloc[0]
         target_data = target_player[self.feature_cols].values.reshape(1, -1)
+        
+        # Pipeline: Scale -> PCA -> Search
         target_scaled = self.scaler.transform(target_data)
-        distances, indices = self.ml_model.kneighbors(target_scaled)
+        target_pca = self.pca.transform(target_scaled) # <--- Transform target to PCA space
+        
+        distances, indices = self.ml_model.kneighbors(target_pca)
         
         results = self.df.iloc[indices[0]].copy()
+        
+        # Calculate Similarity %
         max_dist = distances.max() if distances.max() > 0 else 1
         results['Similarity'] = (1 - (distances[0] / (max_dist * 1.5))) * 100
         results['Similarity'] = results['Similarity'].clip(0, 100)
         
+        # Format for API
         return results.to_dict(orient='records')
 
     def _get_presets(self):
