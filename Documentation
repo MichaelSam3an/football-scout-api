@@ -1,44 +1,78 @@
-Base URL: http://127.0.0.1:5000
+Base URL: http://localhost:5000
 Content-Type: application/json
 
 1. Get Initial Configuration
 Used to populate the UI (dropdowns, search bars, and feature lists) on page load.
+
 Endpoint: /api/config
+
 Method: GET
 
 Returns:
+
 presets: Dictionary of player roles (e.g., "Deep Lying Playmaker") and their default stat weights.
+
 labels: Human-readable names for database columns.
+
 features: List of all available statistical columns.
+
 players: A list of all unique player names for the search bar.
 
-2. Attribute-Based Search
-Used to find players based on specific stats, age, and budget.
+2. Attribute-Based Search (The Scout)
+Used to find players based on specific stats, age, and budget using a Weighted Sum Model.
+
 Endpoint: /api/scout
+
 Method: POST
-Payload (JSON):
+
+Payload (JSON Example):
+
 JSON
 {
   "role": "Striker (Complete)",
-  "budget": 60,
+  "budget": 60,       // In Millions (€60M)
   "max_age": 25,
-  "weights": {
+  "weights": {        // 0-10 Scale
     "npxG_p90": 10,
     "SCA90": 8,
     "PrgP_p90": 5
   }
 }
-Returns: A list of the top 50 player objects matching the criteria, ranked by Scout_Score.
+Returns:
+A list of the top 50 player objects matching the criteria, ranked by Scout_Score (0-100).
 
-3. Find Player Clones
-Used to find the most statistically similar players to a specific target.
+3. Find Player Clones (The AI Engine)
+Used to find the most statistically similar players to a target using PCA + k-Nearest Neighbors.
+
 Endpoint: /api/clone
+
 Method: GET
-Query Parameters: name (string)
-Example URL: /api/clone?name=Mohamed Salah
-Returns: A list of 15 player objects, including a Similarity percentage (0-100).
 
+Query Param: name (The exact name of the player)
 
-CORS: Cross-Origin Resource Sharing is enabled on the server, so you can make requests directly from your frontend (React, Vue, etc.).
-Market Values: All budget inputs are in millions. Sending 50 represents €50,000,000.
-Scout Score: The Scout_Score returned in the search is a percentile-based calculation (0-100).
+Example URL:
+http://localhost:5000/api/clone?name=Mohamed%20Salah
+
+Returns:
+A list of 15 player objects, including:
+
+Similarity: A percentage match (0-100%).
+
+Undervalued_Index: A Moneyball score (0-100) indicating potential market bargains.
+
+Fair_Value: The model's estimated price for the player.
+
+⚙️ Technical Notes for Developers
+CORS Enabled: Cross-Origin Resource Sharing is active. You can fetch data directly from localhost:3000 (React/Vue/Next.js).
+
+Money Units: All budget inputs are in Millions. Sending 50 represents €50,000,000.
+
+The "Undervalued Index":
+
+This is a machine learning prediction (Random Forest).
+
+Logic: It compares a player's Performance Value vs. their Actual Price.
+
+UI Tip: Highlight players with an Index > 80 in Purple or Gold to show "Good Deal."
+
+PCA Integration: The Clone Engine uses Principal Component Analysis to reduce noise. Matches are based on Playstyle, not just raw stat totals.
