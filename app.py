@@ -7,7 +7,7 @@ app = Flask(__name__)
 CORS(app)  # Allows your website to talk to this server
 
 # Initialize Engine
-DATA_FILE = 'scouting_with_market_value2024-2025.csv' # Developer must put CSV here
+DATA_FILE = 'cleaned_scouting_with_market_value2024-2025.csv' # Developer must put CSV here
 engine = ScoutEngine(DATA_FILE)
 
 print("⏳ Initializing Scouting Engine... (Training Models)")
@@ -54,4 +54,5 @@ def clone_player():
     return jsonify(results)
 
 if __name__ == '__main__':
+
     app.run(debug=True, port=5000)
