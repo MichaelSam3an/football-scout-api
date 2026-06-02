@@ -1,114 +1,237 @@
 import pandas as pd
 import numpy as np
-from sklearn.decomposition import PCA
+import unicodedata
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.decomposition import PCA
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from xgboost import XGBRegressor
-import warnings
 
-# Suppress harmless pandas warnings for cleaner console output
-warnings.filterwarnings('ignore')
 
 class ScoutEngine:
-    def __init__(self, file_path, feature_cols=None, tier_threshold=10_000_000, best_xgb_params=None):
-        """
-        Initializes the Segmented Twin-Tier Scout Engine.
-        
-        Parameters:
-        - file_path: Path to the CSV dataset (e.g. Google Drive path)
-        - feature_cols: List of tactical stat columns.
-        - tier_threshold: The Euro value split point to isolate elite pricing mechanics.
-        - best_xgb_params: Parameters for the core regression engines.
-        """
-        self.file_path = file_path
-        self.feature_cols = feature_cols if feature_cols is not None else []
-        self.tier_threshold = tier_threshold
+    def __init__(self, filepath):
+        self.filepath = filepath
         self.df = None
-        self.value_feature_cols = []
-        
-        # Base parameters for our specialized trees
-        self.best_xgb_params = best_xgb_params or {
-          'max_depth': 4,
-          'learning_rate': 0.03,
-          'n_estimators': 600,
-          'subsample': 0.85,
-          'colsample_bytree': 0.75,
-          'min_child_weight': 3,
-          'gamma': 0.1,
-          'reg_alpha': 0.2,
-          'reg_lambda': 1.5
-        }
-        
-        # Twin-Tier Models initialization
-        self.model_tier_base = None
-        self.model_tier_elite = None
-        
-    def load_data(self):
-        """Loads raw CSV data supporting both default and accented European character sets."""
-        print(f"📖 Loading dataset from: {self.file_path}")
-        try:
-            self.df = pd.read_csv(self.file_path, encoding='utf-8')
-        except UnicodeDecodeError:
-            print("⚠️ UTF-8 decoding failed due to special character accents. Falling back to latin-1...")
-            self.df = pd.read_csv(self.file_path, encoding='latin-1')
-            
-        print(f"✅ Data successfully loaded: {self.df.shape[0]} rows, {self.df.shape[1]} columns.")
-        
-        if not self.feature_cols:
-            exclude = ['Player', 'Pos', 'Squad', 'Comp', 'Age', 'market_value_in_eur', 'Fair_Value', 'Undervalued_Index']
-            self.feature_cols = [col for col in self.df.select_dtypes(include=[np.number]).columns if col not in exclude]
-            print(f"⚠️ Automatically inferred {len(self.feature_cols)} tactical feature columns.")
+        self.player_names = []
 
-    def _get_role_group(self, pos):
-        """Helper method to group specific positions into broad scouting categories."""
-        pos = str(pos).upper()
-        if 'GK' in pos: return 'GK'
-        if any(x in pos for x in ['CB', 'FB', 'LB', 'RB', 'WB']): return 'DEF'
-        if any(x in pos for x in ['CM', 'DM', 'AM', 'RM', 'LM']): return 'MID'
-        if any(x in pos for x in ['ST', 'CF', 'RW', 'LW', 'FW']): return 'FWD'
+        # Clone engine
+        self.scaler = None
+        self.pca = None
+        self.feature_cols = []
+        self.knn_models = {}
+        self.role_group_indices = {}
+        self.pca_feature_map = None
+        self.weighted_feature_matrix = None
+
+        # Value engine
+        self.value_model = None
+        self.value_model_name = None
+        self.best_xgb_params = {
+            'n_estimators': 250,
+            'max_depth': 3,
+            'learning_rate': 0.07,
+            'subsample': 0.9,
+            'colsample_bytree': 0.9,
+            'min_child_weight': 4,
+            'reg_alpha': 0.2,
+            'reg_lambda': 1.0
+        }
+        self.value_feature_cols = []
+        self.value_metrics = {}
+        self.model_comparison = {}
+
+        self.presets = self._get_presets()
+        self.labels = self._get_labels()
+
+    def load_data(self):
+        try:
+            try:
+                raw_df = pd.read_csv(self.filepath, encoding='utf-8')
+            except:
+                raw_df = pd.read_csv(self.filepath, encoding='latin-1')
+
+            min_minutes = 600
+
+            if 'Min' in raw_df.columns:
+                self.df = raw_df[raw_df['Min'] >= min_minutes].copy().fillna(0)
+            else:
+                self.df = raw_df.copy().fillna(0)
+
+            self.df.columns = (
+                self.df.columns
+                .str.replace('_per90', '_p90', regex=False)
+                .str.replace('per90', '_p90', regex=False)
+            )
+
+            # Do NOT convert percentages / ratios to per-90
+            ignore = [
+                'Player', 'Pos', 'Squad', 'Comp', 'Age', '90s', 'Min',
+                'Born', 'Rk', 'market_value_in_eur', 'Season',
+                'Won%', 'G/Sh', 'SoT%', 'Pass_Short_Cmp%', 'Pass_Med_Cmp%', 'Pass_Long_Cmp%'
+            ]
+
+            cols_to_convert = []
+            for col in self.df.columns:
+                if (
+                    self.df[col].dtype in ['float64', 'int64']
+                    and col not in ignore
+                    and '_p90' not in col
+                ):
+                    if f'{col}_p90' not in self.df.columns:
+                        cols_to_convert.append(col)
+
+            if cols_to_convert and '90s' in self.df.columns:
+                valid_mask = self.df['90s'] > 0
+                p90_df = pd.DataFrame(index=self.df.index)
+
+                for col in cols_to_convert:
+                    new_col = f'{col}_p90'
+                    p90_df[new_col] = 0.0
+                    p90_df.loc[valid_mask, new_col] = (
+                        self.df.loc[valid_mask, col] / self.df.loc[valid_mask, '90s']
+                    )
+
+                self.df = pd.concat([self.df, p90_df], axis=1)
+
+            self.df.replace([np.inf, -np.inf], 0, inplace=True)
+
+            if 'Player' in self.df.columns:
+                self.player_names = sorted(self.df['Player'].dropna().unique().tolist())
+
+            exclude = [
+                'Player', 'Squad', 'Nation', 'Pos', 'Comp', 'Age', 'Born',
+                '90s', 'Min', 'Rk', 'market_value_in_eur', 'Fair_Value',
+                'Undervalued_Index', 'Season'
+            ]
+
+            self.feature_cols = [
+                c for c in self.df.columns
+                if self.df[c].dtype in ['float64', 'int64'] and c not in exclude
+            ]
+
+            self._train_clone_engine()
+            self._train_value_model()
+            return True
+
+        except Exception as e:
+            print(f"❌ Error loading data: {e}")
+            return False
+
+    # =========================================================
+    # TEXT NORMALIZATION
+    # =========================================================
+    def _normalize_text(self, text):
+        if pd.isna(text):
+            return ""
+        text = str(text).lower().strip()
+        text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('utf-8')
+        return text
+
+    # =========================================================
+    # CLONE ENGINE
+    # =========================================================
+    def _get_role_group(self, pos_value):
+        if pd.isna(pos_value):
+            return 'OTHER'
+
+        pos_value = str(pos_value)
+
+        if 'DF' in pos_value:
+            return 'DF'
+        if 'MF' in pos_value:
+            return 'MF'
+        if 'FW' in pos_value:
+            return 'FW'
         return 'OTHER'
 
+    def _get_clone_role_weights(self):
+        return {
+            'DF': {
+                'Tkl_p90': 10,
+                'Int_p90': 10,
+                'Blocks_p90': 9,
+                'Clr_p90': 9,
+                'Aerials_Won_p90': 8,
+                'Won%': 7,
+                'Recov_p90': 7,
+                'PrgP_p90': 5,
+                'Pass_Long_Cmp_p90': 5
+            },
+            'MF': {
+                'PrgP_p90': 10,
+                'PrgC_p90': 9,
+                'KP_p90': 8,
+                'SCA_p90': 8,
+                'Pass_Short_Cmp_p90': 7,
+                'Pass_Med_Cmp_p90': 7,
+                'Pass_Long_Cmp_p90': 6,
+                'Recov_p90': 6,
+                'Int_p90': 5,
+                'Tkl_p90': 5
+            },
+            'FW': {
+                'npxG_p90': 10,
+                'Gls_p90': 10,
+                'Sh_p90': 8,
+                'SoT_p90': 8,
+                'SCA_p90': 7,
+                'GCA_p90': 6,
+                'PrgC_p90': 7,
+                'Succ_p90': 7,
+                'Touches_Att_Pen_p90': 8,
+                'KP_p90': 4
+            },
+            'OTHER': {}
+        }
+
+    def _get_role_focus_features(self):
+        return {
+            'DF': [
+                'Tkl_p90', 'Int_p90', 'Blocks_p90', 'Clr_p90',
+                'Aerials_Won_p90', 'Won%', 'Recov_p90',
+                'PrgP_p90', 'Pass_Long_Cmp_p90'
+            ],
+            'MF': [
+                'PrgP_p90', 'PrgC_p90', 'KP_p90', 'SCA_p90',
+                'Pass_Short_Cmp_p90', 'Pass_Med_Cmp_p90',
+                'Pass_Long_Cmp_p90', 'Recov_p90', 'Int_p90', 'Tkl_p90'
+            ],
+            'FW': [
+                'npxG_p90', 'Gls_p90', 'Sh_p90', 'SoT_p90',
+                'SCA_p90', 'GCA_p90', 'PrgC_p90',
+                'Succ_p90', 'Touches_Att_Pen_p90', 'KP_p90'
+            ],
+            'OTHER': self.feature_cols[:10]
+        }
+
     def _build_weighted_clone_features(self):
-        """Extracts the contextual numerical matrices for similarity modeling."""
-        return self.df[self.feature_cols].fillna(0).values
+        weighted_df = self.df[self.feature_cols].copy().astype(float)
+        clone_weights = self._get_clone_role_weights()
 
-    def _calc_index(self, row):
-        """Calculates value efficiency metrics as a direct market multiplier."""
-        if row['Fair_Value'] <= 0 or row['market_value_in_eur'] <= 0:
-            return 0
-        return row['Fair_Value'] / row['market_value_in_eur']
+        for col in weighted_df.columns:
+            weighted_df[col] = weighted_df[col] * 1.0
 
-    def _prepare_value_features(self, df):
-        """Builds predictive vectors including exponential age parameters and league categories."""
-        base = df[self.feature_cols + ['Age']].copy()
+        for idx, row in self.df.iterrows():
+            role_group = row.get('Role_Group', 'OTHER')
+            role_weights = clone_weights.get(role_group, {})
 
-        # Capture non-linear performance/financial peak age scaling
-        base['Age_Squared'] = base['Age'] ** 2
-        base['Is_Peak_Age'] = base['Age'].between(23, 28).astype(int)
+            for feature_name, weight in role_weights.items():
+                if feature_name in weighted_df.columns:
+                    weighted_df.at[idx, feature_name] = weighted_df.at[idx, feature_name] * weight
 
-        if 'Comp' in df.columns:
-            comp_dummies = pd.get_dummies(df['Comp'].fillna('Unknown'), prefix='Comp')
-            base = pd.concat([base, comp_dummies], axis=1)
+        return weighted_df
 
-        return base
-
-    def train_clone_engine(self):
-        """Runs variance compression and indexes grouped position matrices for similarity queries."""
-        print("\n🤖 Training Clone Engine...")
-        if self.df is None:
-            raise ValueError("Dataframe not loaded. Call load_data() before training.")
-            
+    def _train_clone_engine(self):
         self.df['Role_Group'] = self.df['Pos'].apply(self._get_role_group) if 'Pos' in self.df.columns else 'OTHER'
 
-        X_raw = self._build_weighted_clone_features()
-        self.scaler = StandardScaler()
-        X_scaled = self.scaler.fit_transform(X_raw)
+        self.weighted_feature_matrix = self._build_weighted_clone_features()
 
-        # Retain 85% variance to eliminate context-dependent stat anomalies (Noise Trimming)
-        self.pca = PCA(n_components=0.85) 
+        self.scaler = StandardScaler()
+        X_scaled = self.scaler.fit_transform(self.weighted_feature_matrix)
+
+        self.pca = PCA(n_components=0.95)
         X_pca = self.pca.fit_transform(X_scaled)
 
         self.pca_feature_map = pd.DataFrame(
@@ -117,7 +240,7 @@ class ScoutEngine:
             columns=[f'PC{i+1}' for i in range(X_pca.shape[1])]
         )
 
-        print(f"📉 Variance Compression Complete: {X_scaled.shape[1]} metrics reduced to {X_pca.shape[1]} PCA components.")
+        print(f"📉 PCA Reduced Features: {X_scaled.shape[1]} -> {X_pca.shape[1]}")
 
         self.knn_models = {}
         self.role_group_indices = {}
@@ -137,131 +260,398 @@ class ScoutEngine:
 
                 self.knn_models[role_group] = knn
                 self.role_group_indices[role_group] = subset_idx
-                
-        print("✅ Similarity Engine Composed.")
 
-    def train_value_model(self):
-        """Executes segmented twin-tier training using isolated logarithmic pricing branches."""
-        print("\n💰 Training Segmented Twin-Tier Valuation Engine...")
-        if self.df is None:
-            raise ValueError("Dataframe not loaded. Call load_data() before training.")
+    def _similarity_from_cosine_distance(self, distances):
+        similarities = (1 - distances) * 100
+        similarities = np.clip(similarities, 0, 100)
+        return similarities
 
+    def _explain_clone_match(self, target_player, clone_player, top_k=3):
+        role_group = target_player.get('Role_Group', 'OTHER')
+        focus_features = self._get_role_focus_features().get(role_group, self.feature_cols[:10])
+
+        valid_features = [f for f in focus_features if f in self.feature_cols]
+
+        comparisons = []
+
+        for feat in valid_features:
+            target_val = float(target_player.get(feat, 0))
+            clone_val = float(clone_player.get(feat, 0))
+
+            diff = abs(target_val - clone_val)
+            scale = max(abs(target_val), abs(clone_val), 1.0)
+            normalized_diff = diff / scale
+
+            comparisons.append({
+                "feature": feat,
+                "target_value": round(target_val, 3),
+                "clone_value": round(clone_val, 3),
+                "difference": round(diff, 3),
+                "normalized_diff": normalized_diff
+            })
+
+        comparisons = sorted(comparisons, key=lambda x: x["normalized_diff"])
+
+        top_matches = [
+            {
+                "feature": item["feature"],
+                "target": item["target_value"],
+                "clone": item["clone_value"]
+            }
+            for item in comparisons[:top_k]
+        ]
+
+        key_differences = [
+            {
+                "feature": item["feature"],
+                "target": item["target_value"],
+                "clone": item["clone_value"]
+            }
+            for item in comparisons[-top_k:]
+        ]
+
+        return top_matches, key_differences
+
+    def find_clones(self, player_name, top_n=10, same_role_only=True):
+        normalized_query = self._normalize_text(player_name)
+
+        exact_mask = self.df['Player'].apply(lambda x: self._normalize_text(x) == normalized_query)
+        matches = self.df[exact_mask]
+
+        if matches.empty:
+            contains_mask = self.df['Player'].apply(lambda x: normalized_query in self._normalize_text(x))
+            matches = self.df[contains_mask]
+
+        if matches.empty:
+            suggestions = [
+                p for p in self.player_names
+                if normalized_query in self._normalize_text(p)
+                or self._normalize_text(p).startswith(normalized_query[:3])
+            ][:10]
+            return {"error": "Player not found", "suggestions": suggestions}
+
+        target_player = matches.iloc[0]
+        target_idx = target_player.name
+        target_role_group = target_player.get('Role_Group', 'OTHER')
+
+        target_row = pd.DataFrame([target_player[self.feature_cols]], columns=self.feature_cols).astype(float)
+        role_weights = self._get_clone_role_weights().get(target_role_group, {})
+
+        for feature_name, weight in role_weights.items():
+            if feature_name in target_row.columns:
+                target_row[feature_name] = target_row[feature_name] * weight
+
+        target_scaled = self.scaler.transform(target_row)
+        target_pca = self.pca.transform(target_scaled)
+
+        if same_role_only and target_role_group in self.knn_models:
+            knn_model = self.knn_models[target_role_group]
+            subset_idx = self.role_group_indices[target_role_group]
+            distances, local_indices = knn_model.kneighbors(
+                target_pca,
+                n_neighbors=min(top_n + 5, len(subset_idx))
+            )
+            candidate_indices = subset_idx[local_indices[0]]
+        else:
+            global_knn = NearestNeighbors(
+                n_neighbors=min(top_n + 5, len(self.df)),
+                metric='cosine',
+                algorithm='brute'
+            )
+            global_knn.fit(self.pca_feature_map.values)
+            distances, local_indices = global_knn.kneighbors(
+                target_pca,
+                n_neighbors=min(top_n + 5, len(self.df))
+            )
+            candidate_indices = self.df.index[local_indices[0]]
+
+        results = self.df.loc[candidate_indices].copy()
+        results['Distance'] = distances[0]
+        results['Similarity'] = self._similarity_from_cosine_distance(results['Distance'].values)
+
+        results = results[results.index != target_idx]
+
+        if 'Pos' in results.columns and 'Pos' in target_player.index:
+            target_pos = str(target_player['Pos'])
+            exact_pos_mask = results['Pos'].astype(str) == target_pos
+
+            exact_pos_results = results[exact_pos_mask].copy()
+            other_results = results[~exact_pos_mask].copy()
+
+            results = pd.concat([exact_pos_results, other_results], axis=0)
+
+        results = results.sort_values(by=['Similarity'], ascending=False).head(top_n)
+
+        explained_results = []
+        for idx, row in results.iterrows():
+            top_matches, key_differences = self._explain_clone_match(target_player, row, top_k=3)
+
+            row_dict = row.to_dict()
+            row_dict["Top_Matches"] = top_matches
+            row_dict["Key_Differences"] = key_differences
+
+            explained_results.append(row_dict)
+
+        return explained_results
+
+    # =========================================================
+    # VALUE ENGINE
+    # =========================================================
+    def _prepare_value_features(self, df):
+        base = df[self.feature_cols + ['Age']].copy()
+
+        if 'Comp' in df.columns:
+            comp_dummies = pd.get_dummies(df['Comp'].fillna('Unknown'), prefix='Comp')
+            base = pd.concat([base, comp_dummies], axis=1)
+
+        return base
+
+    def _evaluate_model(self, model, X_train, X_test, y_train, y_test):
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        y_pred = np.maximum(y_pred, 0)
+
+        mae = mean_absolute_error(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        r2 = r2_score(y_test, y_pred)
+
+        return mae, rmse, r2
+
+    def _train_value_model(self):
         train_df = self.df[self.df['market_value_in_eur'] > 0].copy()
+
         if train_df.empty:
-            print("❌ Error: No valid market valuations detected (>0).")
+            print("❌ No valid rows with market_value_in_eur > 0")
             return
 
         if 'Player' not in train_df.columns:
-            train_df['Player'] = train_df.index
+            print("❌ 'Player' column is required for grouped train/test split.")
+            return
 
-        # Group-safe validation splitting to isolate testing profiles cleanly
+        y = train_df['market_value_in_eur']
+        groups = train_df['Player']
+
         gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-        train_idx, test_idx = next(gss.split(train_df, train_df['market_value_in_eur'], groups=train_df['Player']))
+        train_idx, test_idx = next(gss.split(train_df, y, groups=groups))
 
         train_part = train_df.iloc[train_idx].copy()
         test_part = train_df.iloc[test_idx].copy()
 
-        # Build feature maps and establish static-elimination rules via Random Forest Importance
-        X_train_full = self._prepare_value_features(train_part)
-        X_test_full = self._prepare_value_features(test_part)
-        X_train_full, X_test_full = X_train_full.align(X_test_full, join='left', axis=1, fill_value=0)
+        X_train = self._prepare_value_features(train_part)
+        X_test = self._prepare_value_features(test_part)
 
-        print("🧹 Running dynamic feature importance screening...")
-        selector = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1)
-        selector.fit(X_train_full, np.log1p(train_part['market_value_in_eur']))
-        
-        importance_threshold = np.median(selector.feature_importances_)
-        self.value_feature_cols = X_train_full.columns[selector.feature_importances_ >= importance_threshold].tolist()
-        print(f"🧪 Feature optimization complete: Retained {len(self.value_feature_cols)} primary predictive metrics.")
+        X_train, X_test = X_train.align(X_test, join='left', axis=1, fill_value=0)
 
-        # SEGMENTATION LAYER: Isolate populations into distinct structural tiers
-        # Base Tier: Players under the threshold ceiling
-        train_base = train_part[train_part['market_value_in_eur'] <= self.tier_threshold]
-        # Elite Tier: Hyper-inflated elite player bracket
-        train_elite = train_part[train_part['market_value_in_eur'] > self.tier_threshold]
+        y_train = train_part['market_value_in_eur']
+        y_test = test_part['market_value_in_eur']
 
-        print(f"📊 Segmented Breakdown -> Base Tier Training Size: {len(train_base)} | Elite Tier Training Size: {len(train_elite)}")
+        train_players = set(train_part['Player'])
+        test_players = set(test_part['Player'])
+        overlap = train_players.intersection(test_players)
 
-        # Fit Sub-Models independently to learn distinct market rules
-        xgb_base_eval = XGBRegressor(objective='reg:squarederror', random_state=42, n_jobs=-1, **self.best_xgb_params)
-        xgb_elite_eval = XGBRegressor(objective='reg:squarederror', random_state=42, n_jobs=-1, **self.best_xgb_params)
+        print("\n👥 Grouped Split by Player:")
+        print(f"Train rows   : {len(X_train)}")
+        print(f"Test rows    : {len(X_test)}")
+        print(f"Train players: {len(train_players)}")
+        print(f"Test players : {len(test_players)}")
+        print(f"Overlap      : {len(overlap)} players")
+        print(f"\n🧪 Value model feature count: {X_train.shape[1]}")
 
-        if len(train_base) > 0:
-            X_tr_b = X_train_full.loc[train_base.index, self.value_feature_cols]
-            xgb_base_eval.fit(X_tr_b, np.log1p(train_base['market_value_in_eur']))
-            
-        if len(train_elite) > 0:
-            X_tr_e = X_train_full.loc[train_elite.index, self.value_feature_cols]
-            xgb_elite_eval.fit(X_tr_e, np.log1p(train_elite['market_value_in_eur']))
+        self.value_feature_cols = X_train.columns.tolist()
+        self.model_comparison = {}
 
-        # TESTING STAGE: Programmatic routing based on standard metric distributions
-        X_test_selected = X_test_full[self.value_feature_cols]
-        predictions_raw = []
+        rf_model = RandomForestRegressor(
+            n_estimators=100,
+            random_state=42,
+            n_jobs=-1
+        )
 
-        for idx, row in test_part.iterrows():
-            feat_row = X_test_selected.loc[[idx]]
-            
-            # Use actual ground truth for proper scoring calibration during valuation loops
-            if row['market_value_in_eur'] <= self.tier_threshold:
-                pred_log = xgb_base_eval.predict(feat_row)[0]
-            else:
-                pred_log = xgb_elite_eval.predict(feat_row)[0]
-                
-            predictions_raw.append(np.expm1(pred_log))
+        rf_mae, rf_rmse, rf_r2 = self._evaluate_model(rf_model, X_train, X_test, y_train, y_test)
+        self.model_comparison["Random Forest"] = {
+            "MAE": rf_mae,
+            "RMSE": rf_rmse,
+            "R2": rf_r2
+        }
 
-        predictions_raw = np.maximum(np.array(predictions_raw), 0)
-        y_test_raw = test_part['market_value_in_eur'].values
+        print("\n📊 Model Evaluation:")
+        print("\nRandom Forest:")
+        print(f"MAE : €{rf_mae:,.2f}")
+        print(f"RMSE: €{rf_rmse:,.2f}")
+        print(f"R²  : {rf_r2:.4f}")
 
-        # Calculate Segmented Twin-Tier Evaluation Scores
-        mae = mean_absolute_error(y_test_raw, predictions_raw)
-        rmse = np.sqrt(mean_squared_error(y_test_raw, predictions_raw))
-        r2 = r2_score(y_test_raw, predictions_raw)
+        xgb_model = XGBRegressor(
+            objective='reg:squarederror',
+            random_state=42,
+            n_jobs=-1,
+            **self.best_xgb_params
+        )
 
-        print("\n📊 Segmented Twin-Tier Pipeline Evaluation:")
-        print(f"  • Upgraded Twin XGBoost MAE  : €{mae:,.2f}")
-        print(f"  • Upgraded Twin XGBoost RMSE : €{rmse:,.2f}")
-        print(f"  • Upgraded Twin XGBoost R²   : {r2:.4f}")
+        xgb_mae, xgb_rmse, xgb_r2 = self._evaluate_model(xgb_model, X_train, X_test, y_train, y_test)
+        self.model_comparison["XGBoost_Final"] = {
+            "MAE": xgb_mae,
+            "RMSE": xgb_rmse,
+            "R2": xgb_r2,
+            "params": self.best_xgb_params
+        }
 
-        # RE-FIT STAGE: Production compilation pass using the full dataset
-        print("\n🚀 Compiling finalized segmented production models across all records...")
+        print("\nXGBoost_Final:")
+        print(f"Params: {self.best_xgb_params}")
+        print(f"MAE : €{xgb_mae:,.2f}")
+        print(f"RMSE: €{xgb_rmse:,.2f}")
+        print(f"R²  : {xgb_r2:.4f}")
+
+        self.value_model_name = "XGBoost_Final"
+        self.value_metrics = {
+            "Best_Model": self.value_model_name,
+            "Best_Model_MAE": xgb_mae,
+            "Best_Model_RMSE": xgb_rmse,
+            "Best_Model_R2": xgb_r2,
+            "Train_Rows": len(X_train),
+            "Test_Rows": len(X_test),
+            "Train_Players": len(train_players),
+            "Test_Players": len(test_players),
+            "Player_Overlap": len(overlap),
+            "Value_Feature_Count": X_train.shape[1],
+            "Best_XGB_Params": self.best_xgb_params
+        }
+
+        print(f"\n🏆 Final Value Model: {self.value_model_name}")
+
         full_X = self._prepare_value_features(train_df)
-        full_X_selected = full_X.reindex(columns=self.value_feature_cols, fill_value=0)
+        full_X = full_X.reindex(columns=self.value_feature_cols, fill_value=0)
 
-        final_base_idx = train_df[train_df['market_value_in_eur'] <= self.tier_threshold].index
-        final_elite_idx = train_df[train_df['market_value_in_eur'] > self.tier_threshold].index
+        self.value_model = XGBRegressor(
+            objective='reg:squarederror',
+            random_state=42,
+            n_jobs=-1,
+            **self.best_xgb_params
+        )
 
-        self.model_tier_base = XGBRegressor(objective='reg:squarederror', random_state=42, n_jobs=-1, **self.best_xgb_params)
-        self.model_tier_elite = XGBRegressor(objective='reg:squarederror', random_state=42, n_jobs=-1, **self.best_xgb_params)
+        self.value_model.fit(full_X, y)
 
-        if len(final_base_idx) > 0:
-            self.model_tier_base.fit(full_X_selected.loc[final_base_idx], np.log1p(train_df.loc[final_base_idx, 'market_value_in_eur']))
-        if len(final_elite_idx) > 0:
-            self.model_tier_elite.fit(full_X_selected.loc[final_elite_idx], np.log1p(train_df.loc[final_elite_idx, 'market_value_in_eur']))
-
-        # PREDICTION PRODUCTION PHASE: Route profiles via an internal structural baseline heuristic
         all_X = self._prepare_value_features(self.df)
-        all_X_selected = all_X.reindex(columns=self.value_feature_cols, fill_value=0)
-        
-        # Route profiles to models dynamically based on their baseline tactical statistical weight
-        base_preds_log = self.model_tier_base.predict(all_X_selected)
-        elite_preds_log = self.model_tier_elite.predict(all_X_selected)
-        
-        # Invert scales seamlessly back to true absolute Euros
-        base_preds = np.expm1(base_preds_log)
-        elite_preds = np.expm1(elite_preds_log)
+        all_X = all_X.reindex(columns=self.value_feature_cols, fill_value=0)
 
-        # If a player's raw tactical capacity projects an elite valuation, route to the elite pricing model
-        final_predictions = np.where(base_preds > self.tier_threshold, elite_preds, base_preds)
-        
-        # Final formatting cleanup inside dataset frame
-        self.df['Fair_Value'] = np.maximum(final_predictions, 0)
+        self.df['Fair_Value'] = self.value_model.predict(all_X)
+        self.df['Fair_Value'] = self.df['Fair_Value'].clip(lower=0)
         self.df['Undervalued_Index'] = self.df.apply(self._calc_index, axis=1)
-        
-        print("Base Dataset Appended with Segmented Predictions.")
-        print("✅ Valuation System Compiled.")
 
-    def run_pipeline(self):
-        """Runs sequential execution of clone maps and segmented value calculations."""
-        self.train_clone_engine()
-        self.train_value_model()
-        return self.df
+    # =========================================================
+    # GENERAL METHODS
+    # =========================================================
+    def _calc_index(self, row):
+        actual = row['market_value_in_eur']
+        fair = row['Fair_Value']
+
+        if actual <= 0 or fair <= actual:
+            return 0
+
+        ratio = ((fair - actual) / actual) * 100
+        return min(ratio, 100)
+
+    def get_player_list(self):
+        return self.player_names
+
+    def get_config(self):
+        return {
+            "presets": self.presets,
+            "labels": self.labels,
+            "features": self.feature_cols,
+            "value_metrics": self.value_metrics,
+            "model_comparison": self.model_comparison,
+            "best_model": self.value_model_name,
+            "best_xgb_params": self.best_xgb_params,
+            "value_feature_count": len(self.value_feature_cols)
+        }
+
+    def attribute_search(self, weights, role, budget, max_age):
+        target = self.df.copy()
+
+        if 'Age' in target.columns:
+            target = target[target['Age'] <= max_age]
+
+        if 'Pos' in target.columns:
+            if 'Back' in role:
+                target = target[target['Pos'].str.contains('DF', na=False)]
+            elif 'Mid' in role:
+                target = target[target['Pos'].str.contains('MF', na=False)]
+            elif 'Striker' in role or 'Winger' in role:
+                target = target[target['Pos'].str.contains('FW', na=False)]
+
+        if 'market_value_in_eur' in target.columns:
+            limit = budget * 1_000_000
+            target = target[
+                (target['market_value_in_eur'] <= limit) |
+                (target['market_value_in_eur'].isna())
+            ]
+
+        ranked = pd.DataFrame(index=target.index)
+        valid_weights = {}
+
+        for k, v in weights.items():
+            col = k if k in target.columns else f"{k}_p90"
+            if col in target.columns:
+                ranked[col] = target[col].rank(pct=True)
+                valid_weights[col] = v
+
+        if not valid_weights:
+            return []
+
+        scores = np.zeros(len(target))
+        total_w = sum(valid_weights.values())
+
+        for k, w in valid_weights.items():
+            scores += ranked[k] * w
+
+        target['Scout_Score'] = (scores / total_w) * 100
+        result_df = target.sort_values(by='Scout_Score', ascending=False).head(50)
+
+        return result_df.to_dict(orient='records')
+
+    def _get_presets(self):
+        return {
+            'Center Back (Ball Playing)': {
+                'PrgP_p90': 9, 'Pass_Into_1_3_p90': 8, 'Aerials_Won_p90': 7, 'Int_p90': 7, 'Tkl_p90': 5
+            },
+            'Center Back (Stopper)': {
+                'Aerials_Won_p90': 10, 'Clr_p90': 9, 'Blocks_p90': 8, 'TklW_p90': 7, 'Won%': 6
+            },
+            'Full Back (Attacking)': {
+                'PrgC_p90': 9, 'Crs_p90': 8, 'SCA90': 7, 'Tkl_p90': 6, 'Int_p90': 5
+            },
+            'Defensive Mid (Destroyer)': {
+                'Tkl_p90': 10, 'Int_p90': 9, 'Blocks_p90': 8, 'Recov_p90': 7, 'Pass_Short_Cmp_p90': 5
+            },
+            'Deep Lying Playmaker': {
+                'PrgP_p90': 10, 'Pass_Into_1_3_p90': 9, 'Pass_Long_Cmp_p90': 8, 'Int_p90': 6, 'KP_p90': 5
+            },
+            'Box-to-Box Midfielder': {
+                'PrgC_p90': 8, 'PrgP_p90': 8, 'Tkl_p90': 7, 'SCA90': 7, 'Recov_p90': 7
+            },
+            'Attacking Mid (Creator)': {
+                'SCA90': 10, 'KP_p90': 9, 'Pass_Into_Box_p90': 8, 'Succ_p90': 7, 'PrgC_p90': 7
+            },
+            'Winger (Dribbler)': {
+                'Succ_p90': 10, 'PrgC_p90': 9, 'Touches_Att_Pen_p90': 8, 'SCA90': 7, 'npxG_p90': 6
+            },
+            'Striker (Complete)': {
+                'npxG_p90': 9, 'Sh_p90': 8, 'SCA90': 8, 'PrgP_p90': 7, 'Aerials_Won_p90': 6
+            },
+            'Striker (Poacher)': {
+                'npxG_p90': 10, 'SoT_p90': 9, 'Touches_Att_Pen_p90': 9, 'Gls_p90': 8, 'G/Sh': 7
+            }
+        }
+
+    def _get_labels(self):
+        return {
+            'npxG_p90': 'Non-Pen xG',
+            'Gls_p90': 'Goals',
+            'Ast_p90': 'Assists',
+            'SCA90': 'Shot Creating Actions',
+            'PrgP_p90': 'Progressive Passes',
+            'PrgC_p90': 'Progressive Carries',
+            'Tkl_p90': 'Tackles',
+            'Int_p90': 'Interceptions',
+            'market_value_in_eur': 'Market Value (€)',
+            'Undervalued_Index': 'Undervalued Score (0-100)'
+        }
