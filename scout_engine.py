@@ -1,43 +1,60 @@
 import pandas as pd
 import numpy as np
+from sklearn.cluster import KMeans
 import unicodedata
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.decomposition import PCA
+from sklearn.decomposition import PCA, TruncatedSVD
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from xgboost import XGBRegressor
 
 
 class ScoutEngine:
-    def __init__(self, filepath):
+    def __init__(
+        self,
+        filepath,
+        reduction_method="pca",
+        value_reduction="pca",
+        clone_components=20
+    ):
         self.filepath = filepath
+        self.clone_components = clone_components
+
+        self.reduction_method = reduction_method.lower()
+        self.value_reduction = value_reduction.lower()
+
         self.df = None
         self.player_names = []
 
+        self.cluster_knn_models = {}
+        self.cluster_indices = {}
+
         # Clone engine
         self.scaler = None
-        self.pca = None
+        self.clone_reducer = None
         self.feature_cols = []
         self.knn_models = {}
         self.role_group_indices = {}
-        self.pca_feature_map = None
+        self.clone_reducer_feature_map = None
         self.weighted_feature_matrix = None
 
         # Value engine
         self.value_model = None
         self.value_model_name = None
+
         self.best_xgb_params = {
-            'n_estimators': 250,
-            'max_depth': 3,
-            'learning_rate': 0.07,
+            'n_estimators': 400,
+            'max_depth': 4,
+            'learning_rate': 0.05,
             'subsample': 0.9,
-            'colsample_bytree': 0.9,
-            'min_child_weight': 4,
-            'reg_alpha': 0.2,
+            'colsample_bytree': 0.85,
+            'min_child_weight': 2,
+            'reg_alpha': 0.1,
             'reg_lambda': 1.0
         }
+
         self.value_feature_cols = []
         self.value_metrics = {}
         self.model_comparison = {}
@@ -97,6 +114,51 @@ class ScoutEngine:
 
             self.df.replace([np.inf, -np.inf], 0, inplace=True)
 
+            ELITE_CLUBS = [
+                "Real Madrid",
+                "Barcelona",
+                "Manchester City",
+                "Liverpool",
+                "Arsenal",
+                "Chelsea",
+                "Manchester United",
+                "Bayern Munich",
+                "Paris S-G",
+                "Atletico Madrid",
+            ]
+
+            STRONG_CLUBS = [
+                "Inter",
+                "Milan",
+                "Juventus",
+                "Dortmund",
+                "Leverkusen",
+                "Newcastle",
+                "Napoli",
+                "Roma",
+                "Lazio",
+                "Marseille",
+                "Benfica",
+                "Porto"
+            ]
+
+            def get_club_tier(squad):
+                if squad in ELITE_CLUBS:
+                    return 3
+                elif squad in STRONG_CLUBS:
+                    return 2
+                return 1
+
+            self.df["Club_Tier"] = self.df["Squad"].apply(get_club_tier)
+            self.df["Age_squared"] = self.df["Age"] ** 2
+
+            self.df["Elite_Club"] = (
+                self.df["Squad"]
+                .isin(ELITE_CLUBS)
+                .astype(int)
+            )
+
+
             if 'Player' in self.df.columns:
                 self.player_names = sorted(self.df['Player'].dropna().unique().tolist())
 
@@ -105,11 +167,26 @@ class ScoutEngine:
                 '90s', 'Min', 'Rk', 'market_value_in_eur', 'Fair_Value',
                 'Undervalued_Index', 'Season'
             ]
+            duplicates = self.df.columns[self.df.columns.duplicated()]
+            print("Duplicate columns:", duplicates.tolist())
 
-            self.feature_cols = [
-                c for c in self.df.columns
-                if self.df[c].dtype in ['float64', 'int64'] and c not in exclude
-            ]
+            self.feature_cols = []
+
+            for c in self.df.columns:
+
+                try:
+
+                    if (
+                        self.df[c].dtype in ['float64', 'int64']
+                        and c not in exclude
+                    ):
+                        self.feature_cols.append(c)
+
+                except Exception as e:
+
+                    print("Problem column:", c)
+                    print(type(self.df[c]))
+                    print(e)
 
             self._train_clone_engine()
             self._train_value_model()
@@ -229,18 +306,90 @@ class ScoutEngine:
         self.weighted_feature_matrix = self._build_weighted_clone_features()
 
         self.scaler = StandardScaler()
-        X_scaled = self.scaler.fit_transform(self.weighted_feature_matrix)
-
-        self.pca = PCA(n_components=0.95)
-        X_pca = self.pca.fit_transform(X_scaled)
-
-        self.pca_feature_map = pd.DataFrame(
-            X_pca,
-            index=self.df.index,
-            columns=[f'PC{i+1}' for i in range(X_pca.shape[1])]
+        X_scaled = self.scaler.fit_transform(
+            self.weighted_feature_matrix
         )
 
-        print(f"📉 PCA Reduced Features: {X_scaled.shape[1]} -> {X_pca.shape[1]}")
+        self.clone_reducer = TruncatedSVD(
+            n_components=min(
+                self.clone_components,
+                X_scaled.shape[1] - 1
+            ),
+            algorithm="randomized",
+            random_state=42
+        )
+
+        X_reduced = self.clone_reducer.fit_transform(X_scaled)
+
+        retained_var = np.sum(
+            self.clone_reducer.explained_variance_ratio_
+        )
+
+        print(
+            f"\n⚙ Clone Reduction: "
+            f"{self.reduction_method.upper()}"
+        )
+
+        print(
+            f"Features Reduced: "
+            f"{X_scaled.shape[1]} -> {X_reduced.shape[1]}"
+        )
+
+        print(
+            f"Variance Retained: "
+            f"{retained_var:.4f}"
+        )
+
+        print(
+            f"📊 {self.reduction_method.upper()} Variance Retained: "
+            f"{retained_var:.4f}"
+        )
+
+        self.clone_reducer_feature_map = pd.DataFrame(
+            X_reduced,
+            index=self.df.index,
+            columns=[f'PC{i+1}' for i in range(X_reduced.shape[1])]
+        )
+
+        self.cluster_knn_models = {}
+        self.cluster_indices = {}
+        self.df["Role_Cluster"] = -1
+
+        for role_group in self.df["Role_Group"].dropna().unique():
+            subset_idx = self.df[self.df["Role_Group"] == role_group].index
+
+            if len(subset_idx) < 8:
+                continue
+
+            subset_vectors = self.clone_reducer_feature_map.loc[subset_idx].values
+
+            n_clusters = min(4, max(2, len(subset_idx) // 20))
+            n_clusters = min(n_clusters, len(subset_idx))
+
+            kmeans = KMeans(
+                n_clusters=n_clusters,
+                random_state=42,
+                n_init=20
+            )
+
+            labels = kmeans.fit_predict(subset_vectors)
+            self.df.loc[subset_idx, "Role_Cluster"] = labels
+
+            for label in np.unique(labels):
+                cluster_idx = subset_idx[labels == label]
+
+                if len(cluster_idx) >= 3:
+                    cluster_vectors = self.clone_reducer_feature_map.loc[cluster_idx].values
+
+                    knn = NearestNeighbors(
+                        n_neighbors=min(20, len(cluster_idx)),
+                        metric='cosine',
+                        algorithm='brute'
+                    )
+                    knn.fit(cluster_vectors)
+
+                    self.cluster_knn_models[(role_group, int(label))] = knn
+                    self.cluster_indices[(role_group, int(label))] = cluster_idx
 
         self.knn_models = {}
         self.role_group_indices = {}
@@ -249,7 +398,7 @@ class ScoutEngine:
             subset_idx = self.df[self.df['Role_Group'] == role_group].index
 
             if len(subset_idx) >= 3:
-                subset_vectors = self.pca_feature_map.loc[subset_idx].values
+                subset_vectors = self.clone_reducer_feature_map.loc[subset_idx].values
 
                 knn = NearestNeighbors(
                     n_neighbors=min(20, len(subset_idx)),
@@ -342,9 +491,21 @@ class ScoutEngine:
                 target_row[feature_name] = target_row[feature_name] * weight
 
         target_scaled = self.scaler.transform(target_row)
-        target_pca = self.pca.transform(target_scaled)
+        target_pca = self.clone_reducer.transform(target_scaled)
 
-        if same_role_only and target_role_group in self.knn_models:
+        target_cluster = int(target_player.get("Role_Cluster", -1))
+        cluster_key = (target_role_group, target_cluster)
+
+        if same_role_only and cluster_key in self.cluster_knn_models:
+            knn_model = self.cluster_knn_models[cluster_key]
+            subset_idx = self.cluster_indices[cluster_key]
+            distances, local_indices = knn_model.kneighbors(
+                target_pca,
+                n_neighbors=min(top_n + 5, len(subset_idx))
+            )
+            candidate_indices = subset_idx[local_indices[0]]
+
+        elif same_role_only and target_role_group in self.knn_models:
             knn_model = self.knn_models[target_role_group]
             subset_idx = self.role_group_indices[target_role_group]
             distances, local_indices = knn_model.kneighbors(
@@ -352,13 +513,14 @@ class ScoutEngine:
                 n_neighbors=min(top_n + 5, len(subset_idx))
             )
             candidate_indices = subset_idx[local_indices[0]]
+
         else:
             global_knn = NearestNeighbors(
                 n_neighbors=min(top_n + 5, len(self.df)),
                 metric='cosine',
                 algorithm='brute'
             )
-            global_knn.fit(self.pca_feature_map.values)
+            global_knn.fit(self.clone_reducer_feature_map.values)
             distances, local_indices = global_knn.kneighbors(
                 target_pca,
                 n_neighbors=min(top_n + 5, len(self.df))
@@ -398,12 +560,96 @@ class ScoutEngine:
     # VALUE ENGINE
     # =========================================================
     def _prepare_value_features(self, df):
-        base = df[self.feature_cols + ['Age']].copy()
+        base = df[
+            self.feature_cols +
+            [
+                'Age',
+                'Age_squared',
+                'Club_Tier',
+                'Elite_Club'
+            ]
+        ].copy()
+        base['Age_Cubed'] = base['Age'] ** 2
+
+        if 'npxG_p90' in df.columns:
+            base['Age_x_npxG'] = (
+                base['Age'] * df['npxG_p90']
+            )
+
+        if 'Gls_p90' in df.columns:
+            base['Age_x_Gls'] = (
+                base['Age'] * df['Gls_p90']
+            )
+        base['Is_Peak_Age'] = (
+            (base['Age'] >= 23)
+            & (base['Age'] <= 28)
+        ).astype(int)
+
+
+       # NEW
+        big_nations = [
+            'ENG',
+            'BRA',
+            'ARG',
+            'FRA',
+            'ESP',
+            'POR',
+            'GER',
+            'ITA',
+            'NED'
+        ]
+
+        if 'Nation' in df.columns:
+
+            base['Big_Football_Nation'] = (
+                df['Nation']
+                .astype(str)
+                .str.upper()
+                .str.contains(
+                    '|'.join(big_nations),
+                    regex=True
+                )
+            ).astype(int)
+
 
         if 'Comp' in df.columns:
-            comp_dummies = pd.get_dummies(df['Comp'].fillna('Unknown'), prefix='Comp')
-            base = pd.concat([base, comp_dummies], axis=1)
+            comp_dummies = pd.get_dummies(
+                df['Comp'].fillna('Unknown'),
+                prefix='Comp'
+            )
 
+            base = pd.concat(
+                [base, comp_dummies],
+                axis=1
+            )
+
+        # NEW
+        if 'Squad' in df.columns:
+
+            squad_dummies = pd.get_dummies(
+                df['Squad'].fillna('Unknown'),
+                prefix='Squad'
+            )
+
+            base = pd.concat(
+                [base, squad_dummies],
+                axis=1
+            )
+
+        if 'Pos' in df.columns:
+
+            pos_dummies = pd.get_dummies(
+                df['Pos'].fillna('Unknown'),
+                prefix='Pos'
+            )
+
+            base = pd.concat(
+                [base, pos_dummies],
+                axis=1
+            )
+
+
+        base = base.loc[:, ~base.columns.duplicated()]
         return base
 
     def _evaluate_model(self, model, X_train, X_test, y_train, y_test):
@@ -431,7 +677,7 @@ class ScoutEngine:
         y = train_df['market_value_in_eur']
         groups = train_df['Player']
 
-        gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+        gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=123)
         train_idx, test_idx = next(gss.split(train_df, y, groups=groups))
 
         train_part = train_df.iloc[train_idx].copy()
@@ -441,6 +687,82 @@ class ScoutEngine:
         X_test = self._prepare_value_features(test_part)
 
         X_train, X_test = X_train.align(X_test, join='left', axis=1, fill_value=0)
+        self.original_value_columns = X_train.columns.tolist()
+        # =====================================
+        # VALUE MODEL DIMENSIONALITY REDUCTION
+        # =====================================
+
+        rf_model = RandomForestRegressor(
+            n_estimators=100,
+            random_state=42,
+            n_jobs=-1
+        )
+
+        self.value_scaler = StandardScaler()
+
+        X_train_scaled = self.value_scaler.fit_transform(X_train)
+        X_test_scaled = self.value_scaler.transform(X_test)
+
+        if self.value_reduction == "pca":
+
+            self.value_pca = PCA(
+                n_components=0.985,
+                random_state=42
+            )
+
+        elif self.value_reduction == "rsvd":
+
+            self.value_pca = TruncatedSVD(
+                n_components=min(
+                    120,
+                    X_train_scaled.shape[1] - 1
+                ),
+                algorithm="randomized",
+                random_state=42
+            )
+
+        elif self.value_reduction == "none":
+
+            self.value_pca = None
+
+        else:
+
+            raise ValueError(
+                "value_reduction must be "
+                "'none', 'pca', or 'rsvd'"
+            )
+
+        if self.value_pca is not None:
+
+            X_train = self.value_pca.fit_transform(
+                X_train_scaled
+            )
+
+            X_test = self.value_pca.transform(
+                X_test_scaled
+            )
+
+            print(
+                f"\n⚙ Value Model Reduction: "
+                f"{self.value_reduction.upper()}"
+            )
+
+            print(
+                f"Features Reduced: "
+                f"{X_train_scaled.shape[1]} -> {X_train.shape[1]}"
+            )
+
+        else:
+
+            X_train = X_train_scaled
+            X_test = X_test_scaled
+
+            print("\n⚙ Value Model Reduction: NONE")
+        print(
+            f"Features Reduced: "
+            f"{X_train_scaled.shape[1]} -> {X_train.shape[1]}"
+        )
+
 
         y_train = train_part['market_value_in_eur']
         y_test = test_part['market_value_in_eur']
@@ -457,14 +779,13 @@ class ScoutEngine:
         print(f"Overlap      : {len(overlap)} players")
         print(f"\n🧪 Value model feature count: {X_train.shape[1]}")
 
-        self.value_feature_cols = X_train.columns.tolist()
-        self.model_comparison = {}
-
-        rf_model = RandomForestRegressor(
-            n_estimators=100,
-            random_state=42,
-            n_jobs=-1
-        )
+        if isinstance(X_train, pd.DataFrame):
+            self.value_feature_cols = X_train.columns.tolist()
+        else:
+            self.value_feature_cols = [
+                f"PC{i+1}"
+                for i in range(X_train.shape[1])
+            ]
 
         rf_mae, rf_rmse, rf_r2 = self._evaluate_model(rf_model, X_train, X_test, y_train, y_test)
         self.model_comparison["Random Forest"] = {
@@ -485,8 +806,19 @@ class ScoutEngine:
             n_jobs=-1,
             **self.best_xgb_params
         )
+        xgb_model.fit(X_train, y_train)
 
-        xgb_mae, xgb_rmse, xgb_r2 = self._evaluate_model(xgb_model, X_train, X_test, y_train, y_test)
+        y_pred = xgb_model.predict(X_test)
+        y_pred = np.maximum(y_pred, 0)
+
+        # Save for analysis
+        self.y_test = y_test.copy()
+        self.y_pred = pd.Series(y_pred, index=y_test.index)
+
+        xgb_mae = mean_absolute_error(y_test, y_pred)
+        xgb_rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        xgb_r2 = r2_score(y_test, y_pred)
+
         self.model_comparison["XGBoost_Final"] = {
             "MAE": xgb_mae,
             "RMSE": xgb_rmse,
@@ -518,19 +850,47 @@ class ScoutEngine:
         print(f"\n🏆 Final Value Model: {self.value_model_name}")
 
         full_X = self._prepare_value_features(train_df)
-        full_X = full_X.reindex(columns=self.value_feature_cols, fill_value=0)
+
+
+        duplicates = full_X.columns[full_X.columns.duplicated()]
+        print("FULL_X DUPLICATES:", duplicates.tolist())
+        full_X = full_X.reindex(
+            columns=self.original_value_columns,
+            fill_value=0
+        )
+
+        full_X_scaled = self.value_scaler.transform(full_X)
+
+        if self.value_pca is not None:
+            full_X = self.value_pca.transform(full_X_scaled)
+        else:
+            full_X = full_X_scaled
 
         self.value_model = XGBRegressor(
-            objective='reg:squarederror',
-            random_state=42,
-            n_jobs=-1,
-            **self.best_xgb_params
-        )
+                    objective='reg:squarederror',
+                    random_state=42,
+                    n_jobs=-1,
+                    **self.best_xgb_params
+                )
 
         self.value_model.fit(full_X, y)
 
         all_X = self._prepare_value_features(self.df)
-        all_X = all_X.reindex(columns=self.value_feature_cols, fill_value=0)
+
+
+        duplicates = all_X.columns[all_X.columns.duplicated()]
+        print("ALL_X DUPLICATES:", duplicates.tolist())
+        all_X = all_X.reindex(
+            columns=self.original_value_columns,
+            fill_value=0
+        )
+
+        all_X_scaled = self.value_scaler.transform(all_X)
+
+        if self.value_pca is not None:
+            all_X = self.value_pca.transform(all_X_scaled)
+        else:
+            all_X = all_X_scaled
 
         self.df['Fair_Value'] = self.value_model.predict(all_X)
         self.df['Fair_Value'] = self.df['Fair_Value'].clip(lower=0)
