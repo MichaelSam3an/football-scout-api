@@ -1055,6 +1055,41 @@ class ScoutEngine:
             }
         }
 
+    def get_player(self, player_name, squad=None):
+        matches = self.df[self.df['Player'] == player_name]
+
+        if squad:
+            squad_matches = matches[matches['Squad'] == squad]
+            if not squad_matches.empty:
+                matches = squad_matches
+
+        if matches.empty:
+            return {"error": "Player not found"}
+
+        # Most minutes = most representative row for multi-club players
+        player = matches.sort_values('Min', ascending=False).iloc[0]
+        data = player.to_dict()
+
+        # Finisher ratio — null for defenders / players with 0 npxG
+        npxg = data.get('npxG', 0)
+        gls = data.get('Gls', 0)
+        if npxg and npxg > 0:
+            ratio = round(gls / npxg, 2)
+            if ratio > 1.2:
+                badge = 'Clinical'
+            elif ratio >= 0.8:
+                badge = 'Average'
+            else:
+                badge = 'Wasteful'
+        else:
+            ratio = None
+            badge = None
+
+        data['finisher_ratio'] = ratio
+        data['finisher_badge'] = badge
+
+        return data
+    
     def _get_labels(self):
         return {
             'npxG_p90': 'Non-Pen xG',
