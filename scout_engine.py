@@ -912,6 +912,59 @@ class ScoutEngine:
     def get_player_list(self):
         return self.player_names
 
+
+    def get_dashboard_data(self):
+        df = self.df.copy()
+
+        # KPIs
+        total_players = len(df)
+        total_goals = int(df['Gls'].sum())
+        eff_df = df[df['npxG'] >= 1.0].copy()
+        eff_df['_ratio'] = eff_df['Gls'] / eff_df['npxG']
+        clinical_count = int((eff_df['_ratio'] > 1.2).sum())
+        avg_xg_efficiency = round(float(eff_df['_ratio'].mean()), 2) if len(eff_df) > 0 else 0.0
+
+        cols_base = ['Player', 'Squad', 'Pos']
+
+        top_scorers = df.nlargest(5, 'Gls')[cols_base + ['Gls', 'npxG']].round(2).to_dict('records')
+        top_assisters = df.nlargest(5, 'Ast')[cols_base + ['Ast']].round(2).to_dict('records')
+
+        # Most Clinical (min npxG 2.0)
+        clin_df = df[df['npxG'] >= 2.0].copy()
+        clin_df['finisher_ratio'] = (clin_df['Gls'] / clin_df['npxG']).round(2)
+        clin_df['finisher_badge'] = clin_df['finisher_ratio'].apply(
+            lambda r: 'Clinical' if r > 1.2 else ('Average' if r >= 0.8 else 'Wasteful')
+        )
+        most_clinical = clin_df.nlargest(5, 'finisher_ratio')[
+            cols_base + ['Gls', 'npxG', 'finisher_ratio', 'finisher_badge', 'market_value_in_eur']
+        ].round(2).to_dict('records')
+
+        # Hidden Gems (min market_value > 0)
+        gems_df = df[df['market_value_in_eur'] > 0]
+        hidden_gems = gems_df.nlargest(5, 'Undervalued_Index')[
+            cols_base + ['Age', 'market_value_in_eur', 'Fair_Value', 'Undervalued_Index']
+        ].round(2).to_dict('records')
+
+        # Team Goals vs xG (top 15 by goals)
+        team_agg = df.groupby('Squad').agg(goals=('Gls', 'sum'), xg=('npxG', 'sum')).reset_index()
+        team_agg['goals'] = team_agg['goals'].astype(int)
+        team_agg['xg'] = team_agg['xg'].round(1)
+        team_goals_vs_xg = team_agg.nlargest(15, 'goals').to_dict('records')
+
+        return {
+            'kpis': {
+                'total_players': total_players,
+                'total_goals': total_goals,
+                'clinical_count': clinical_count,
+                'avg_xg_efficiency': avg_xg_efficiency,
+            },
+            'top_scorers': top_scorers,
+            'top_assisters': top_assisters,
+            'most_clinical': most_clinical,
+            'hidden_gems': hidden_gems,
+            'team_goals_vs_xg': team_goals_vs_xg,
+        }
+
     def get_config(self):
         return {
             "presets": self.presets,
